@@ -24,7 +24,7 @@
 //
 // specific definitions for this product
 #define SYSEX_PRODUCT		0x21			// SYSEX product ID
-#define APP_BASE_ADDR		0xA000			// Application base address
+#define APP_BASE_ADDR		0x0600			// Application base address
 
 // definitions to specify structure of a sysex message
 #define SYSEX_DATA_SIZE		32	// the number of data bytes in each sysex message
