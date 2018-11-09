@@ -66,7 +66,6 @@
 //
 // TYPE DEFINITIONS
 //
-
 typedef unsigned char byte;
 
 // Flash codes for errors
@@ -80,18 +79,30 @@ enum {
 	ERR_OVERLOW	= 7		// data too large for available memory space
 };
 
+//
+// FUNCTION PROTOTYPES
+//
 void bootloader(void);
 void ResetISR(void);
 void IntDefaultHandler(void);
 void delay(int count);
 extern void _vStackTop(void);
 
-//*****************************************************************************
-// Flash Configuration block : 16-byte flash configuration field that stores
-// default protection settings (loaded on reset) and security information that
-// allows the MCU to restrict access to the Flash Memory module.
-// Placed at address 0x400 by the linker script.
-//*****************************************************************************
+//
+// GLOBAL DATA
+// Don't want to have anything left on the stack when we invoke
+// the main app, so we just make this data global
+//
+typedef void (*app_ptr_t)(void);
+unsigned int *app_vtor;
+unsigned int *pSCB_VTOR;
+app_ptr_t the_app;
+
+
+///////////////////////////////////////////////////////////////////////////
+// Flash configuration block must be placed at absolute address 0x400
+// and defines flash access security
+///////////////////////////////////////////////////////////////////////////
 __attribute__ ((used,section(".FlashConfig"))) const struct {
     unsigned int word1;
     unsigned int word2;
@@ -100,13 +111,13 @@ __attribute__ ((used,section(".FlashConfig"))) const struct {
 } Flash_Config = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFEFFFF};
 
 
-//*****************************************************************************
-// The vector table.
-// This relies on the linker script to place at correct location in memory.
-//*****************************************************************************
+///////////////////////////////////////////////////////////////////////////
+// The interrupt vector table will be placed at address 0 in memory. The
+// bootloader does not use any interrupts so all point to the same dummy
+// routine
+///////////////////////////////////////////////////////////////////////////
 extern void (* const g_pfnVectors[])(void);
 extern void * __Vectors __attribute__ ((alias ("g_pfnVectors")));
-
 __attribute__ ((used, section(".isr_vector")))
 void (* const g_pfnVectors[])(void) = {
     // Core Level - CM0P
@@ -160,12 +171,13 @@ void (* const g_pfnVectors[])(void) = {
 };
 
 ///////////////////////////////////////////////////////////////////////////
-// This is the entry point
+// The "Reset" interrupt service routine which defines the entry point
+// of the bootloader routine
 ///////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".after_vectors.reset")))
 void ResetISR(void) {
 
-    // disable watchdog
+    // disable watchdogs
     __asm volatile ("cpsid i");
     WDOG->CNT = WDOG_UPDATE_KEY1;
     WDOG->CNT = WDOG_UPDATE_KEY2;
@@ -175,6 +187,7 @@ void ResetISR(void) {
     __asm volatile ("cpsie i");
 
     // configure the digital input for the "off" switch
+    // and allow to settle
 	GPIOB->PDDR &= ~(GPIOB_BIT_E1);
 	GPIOB->PIDR &= ~(GPIOB_BIT_E1);
 	PORT->PUEH |= (GPIOB_BIT_E1);
@@ -184,9 +197,9 @@ void ResetISR(void) {
 	GPIOB->PDDR |= GPIOB_BIT_E2;
 	GPIOB->PSOR = GPIOB_BIT_E2;
 
-	// is the "off" switch being pressed?
+	// is the "off" switch being pressed? (this is the user option
+	// to start up the bootloader at power on
     if(!(GPIOB->PDIR & GPIOB_BIT_E1)) {
-
     	// run the bootloader (should not return)
     	bootloader();
     }
@@ -194,16 +207,13 @@ void ResetISR(void) {
 
     	// change the vector table location to point at the
     	// application base address
-    	unsigned int *app_vtor = (unsigned int*)APP_BASE_ADDR;
-    	unsigned int * pSCB_VTOR = (unsigned int *) 0xE000ED08;
+    	app_vtor = (unsigned int*)APP_BASE_ADDR;
+    	pSCB_VTOR = (unsigned int *) 0xE000ED08;
     	*pSCB_VTOR = (unsigned int)app_vtor;
 
     	// get the address of the reset vector for the application
-    	// from address 1 of the vector table
-    	typedef void (*app_ptr_t)(void);
-    	app_ptr_t the_app = (app_ptr_t)app_vtor[1];
-
-    	// invoke the application via its reset vector
+    	// from address 1 of the vector table and invoke it
+    	the_app = (app_ptr_t)app_vtor[1];
     	the_app();
     }
 
@@ -211,31 +221,26 @@ void ResetISR(void) {
     for(;;);
 }
 
+///////////////////////////////////////////////////////////////////////////
+// The dummy service routine for unused interrupts
+///////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".after_vectors.zzz")))
 void IntDefaultHandler(void) {
 	for(;;);
 }
 
-//__attribute__ ((section(".after_vectors.zzz")))
+///////////////////////////////////////////////////////////////////////////
+// Simple delay routine
+///////////////////////////////////////////////////////////////////////////
 void delay(int count) {
 	while(count--) {
-		for(volatile int q = 0; q<2000; ++q) {
-			//asm("nop");
-		}
+		for(volatile int q = 0; q<2000; ++q);
 	}
 }
 
-/*
-__attribute__ ((section(".after_vectors.zzz")))
-void uart_init() {
-    SIM->SCGC |= SIM_SCGC_UART0_MASK;
-	UART0->BDH = 0;
-	UART0->BDL = 40;
-    UART0->C2 |= (UART_C2_TE_MASK|UART_C2_RE_MASK); // enable rx/tx
-}
-*/
-
-//__attribute__ ((section(".after_vectors.zzz")))
+///////////////////////////////////////////////////////////////////////////
+// Report an error by flashing red LED
+///////////////////////////////////////////////////////////////////////////
 void error(int code) {
 	LED_OFF(LED_BLUE);
 	LED_OFF(LED_YELLOW);
@@ -250,57 +255,49 @@ void error(int code) {
 	}
 }
 
-/*
-__attribute__ ((section(".after_vectors.zzz")))
-byte read_byte(byte *ch) {
-	while(!(UART0->S1 & UART_S1_RDRF_MASK)) {
-		if(UART0->S1 & (UART_S1_OR_MASK|UART_S1_NF_MASK|UART_S1_FE_MASK|UART_S1_PF_MASK)) {
-			return 0;
-		}
-	}
-	*ch = UART0->D;
-	return 1;
-}
-*/
-
-//Before launching a command, FSTAT[ACCERR] and FSTAT[FPVIOL] must be cleared
-//and the FSTAT[CCIF] flag will be tested to determine the status of the current command
-//write sequence. If FSTAT[CCIF] is 0, indicating that the previous command write
-//sequence is still active, a new command write sequence cannot be started and all writes to
-
+///////////////////////////////////////////////////////////////////////////
+// Ensure that the flash module is idle before setting up a new command
+///////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".after_vectors.zzz")))
 void fc_init() {
 	while(!(FTMRH->FSTAT & 0x80));
 }
-// set up a parameter for a flash command
+
+///////////////////////////////////////////////////////////////////////////
+// Configure a parameter for a flash command
+///////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".after_vectors.zzz")))
 void fc_param(uint8_t index, uint8_t hi, uint8_t lo) {
     FTMRH->FCCOBIX = index;
     FTMRH->FCCOBHI = hi;
     FTMRH->FCCOBLO = lo;
 }
-// run a flash command
+
+///////////////////////////////////////////////////////////////////////////
+// Execute a flash manager command
+///////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".after_vectors.zzz")))
 void fc_run() {
     __asm volatile ("cpsid i");
-	while(!(FTMRH->FSTAT & 0x80));
+	while(!(FTMRH->FSTAT & 0x80)); 	// ensure flash module is idle
 	FTMRH->FCLKDIV &= 0xe0;
-	FTMRH->FCLKDIV |= 0x13; // divide flash clock for 20MHz bus clock
-	FTMRH->FSTAT |= 0x30; // clear ACCERR and FPVIOL (write 1 to clear bits!)
-	MCM->PLACR |= (1U<<16);
-	FTMRH->FSTAT |= 0x80; // kick off the command
-	while(!(FTMRH->FSTAT & 0x80)); // wait for CCIF to go high
-	MCM->PLACR &= ~(1U<<16);
-    __asm volatile ("cpsie i"); // Reenable interrupts
+	FTMRH->FCLKDIV |= 0x13; 		// divide flash clock for 20MHz bus clock
+	FTMRH->FSTAT |= 0x30; 			// clear ACCERR and FPVIOL (write 1 to clear bits!)
+	MCM->PLACR |= (1U<<16); 		// allow flash module to block if other access in progress
+	FTMRH->FSTAT |= 0x80; 			// kick off the command
+	while(!(FTMRH->FSTAT & 0x80)); 	// wait for CCIF to go high
+	MCM->PLACR &= ~(1U<<16); 		// remove blocking
+    __asm volatile ("cpsie i"); 	// Reenable interrupts
 
+    // check the error bits
 	if(FTMRH->FSTAT & 0x30) {
 		error(ERR_FLASH);
 	}
-
 }
 
-
-
+///////////////////////////////////////////////////////////////////////////
+// Main bootloader routine
+///////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".after_vectors.zzz")))
 void bootloader(void) {
 	/*
@@ -359,8 +356,6 @@ void bootloader(void) {
 	UART0->BDL = 40;
     UART0->C2 |= UART_C2_RE_MASK;
 
-//    uart_init();
-
 	// set LEDs to initial state
     LED_ON(LED_BLUE);
     LED_ON(LED_YELLOW);
@@ -369,7 +364,7 @@ void bootloader(void) {
 	int i;
     int seq_no = 0;
     int addr = APP_BASE_ADDR;
-    for(;;) {
+    for(;;) { // forever... there's no coming back
 
 
     	//////////////////////////////////////////////////////////////////////////////////////
@@ -395,7 +390,8 @@ void bootloader(void) {
     	//////////////////////////////////////////////////////////////////////////////////////
 
       	// check that data is framed by standard MIDI sysex start/end
-      	// if not, there is a problem with the format of the file
+      	// if not, there is a comms error or problem with the format
+      	// of the file
     	if(sysex[SYSEX_START_OFS] != SYSEX_START ||
     		sysex[SYSEX_END_OFS] != SYSEX_END) {
 			error(ERR_FORMAT);
@@ -443,10 +439,10 @@ void bootloader(void) {
       	// Form the full 8 bit data for programming
     	//////////////////////////////////////////////////////////////////////////////////////
 
-    	// MIDI data is 7 bit, so each of the 32 data bits is missing
-    	// its top bit. These follow the data bytes, packed into 5
-    	// additional bytes. We need to stuff these top bits back in
-    	// again...
+    	// MIDI data is 7 bit, so each of the 32 data bytes is missing
+    	// it's top bit. These follow the data bytes, packed into 5
+    	// additional bytes. We need to stuff these top bits back into
+    	// the data bytes...
     	byte mask = 1;
     	int bit7src = SYSEX_BIT7_OFS;
     	for(i=SYSEX_DATA_OFS; i<SYSEX_BIT7_OFS; ++i) {
@@ -463,6 +459,8 @@ void bootloader(void) {
     	//////////////////////////////////////////////////////////////////////////////////////
       	// Program the data to FLASH
     	//////////////////////////////////////////////////////////////////////////////////////
+
+    	// the 32 bytes are programmed in four blocks of 8 bytes
     	int src = SYSEX_DATA_OFS;
     	for(i=0; i<4; ++i) {
 
