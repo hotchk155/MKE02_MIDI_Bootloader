@@ -1,58 +1,90 @@
+///////////////////////////////////////////////////////////////////////////
+//
+// MKE02Z64xxx4 MIDI SYSEX BOOTLOADER
+// Sixty-four pixels ltd / Jason Hotchkiss
+//
+// 1 	09nov18
+//
+///////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////
+//
+//
+//
+///////////////////////////////////////////////////////////////////////////
+
+//
+// INCLUDES
+//
 #include "MKE02Z4.h"
 
-typedef unsigned char byte;
 
-enum {
-	ERR_OK,
-	ERR_SERIAL,
-	ERR_FORMAT,
-	ERR_ID,
-	ERR_CSUM,
-	ERR_SEQ,
-	ERR_FLASH
-};
+//
+// MACRO DEFS
+//
+// specific definitions for this product
+#define SYSEX_PRODUCT		0x21			// SYSEX product ID
+#define APP_BASE_ADDR		0xA000			// Application base address
 
-#define SYSEX_DATA_SIZE		32
-#define SYSEX_BIT7_SIZE		5
-
+// definitions to specify structure of a sysex message
+#define SYSEX_DATA_SIZE		32	// the number of data bytes in each sysex message
+#define SYSEX_BIT7_SIZE		5	// the number of additional data bytes to hold top bits
 #define SYSEX_START_OFS		0
-#define SYSEX_ID0_OFS		(SYSEX_START_OFS + 1)
-#define SYSEX_ID1_OFS		(SYSEX_ID0_OFS + 1)
-#define SYSEX_PRODUCT_OFS	(SYSEX_ID1_OFS + 1)
-#define SYSEX_SEQ_OFS		(SYSEX_PRODUCT_OFS + 1)
-#define SYSEX_DATA_OFS		(SYSEX_SEQ_OFS + 1)
-#define SYSEX_BIT7_OFS		(SYSEX_DATA_OFS + SYSEX_DATA_SIZE)
-#define SYSEX_CSUM_OFS		(SYSEX_BIT7_OFS + SYSEX_BIT7_SIZE)
-#define SYSEX_END_OFS		(SYSEX_CSUM_OFS + 1)
-#define SYSEX_BUF_SIZE		(SYSEX_END_OFS + 1)
+#define SYSEX_ID0_OFS		(SYSEX_START_OFS + 1)					// 1
+#define SYSEX_ID1_OFS		(SYSEX_ID0_OFS + 1)						// 2
+#define SYSEX_PRODUCT_OFS	(SYSEX_ID1_OFS + 1)						// 3
+#define SYSEX_SEQ_OFS		(SYSEX_PRODUCT_OFS + 1)					// 4
+#define SYSEX_DATA_OFS		(SYSEX_SEQ_OFS + 1)						// 5
+#define SYSEX_BIT7_OFS		(SYSEX_DATA_OFS + SYSEX_DATA_SIZE)		// 37
+#define SYSEX_CSUM_OFS		(SYSEX_BIT7_OFS + SYSEX_BIT7_SIZE)		// 42
+#define SYSEX_END_OFS		(SYSEX_CSUM_OFS + 1)					// 43
+#define SYSEX_BUF_SIZE		(SYSEX_END_OFS + 1)						// 44
 
-
+// specific values of fields in the sysex message
 #define SYSEX_START			0xF0
 #define SYSEX_ID0			0x00
 #define SYSEX_ID1			0x7F
 #define SYSEX_END			0xF7
 
-#define SYSEX_PRODUCT		0x21
-#define WRITE_BASE_ADDR		0xA000
-
+// define GPIO bits for inputs and outputs
 #define GPIOA_BIT_B5 (1U<<((1*8) + 5))
 #define GPIOA_BIT_C2 (1U<<((2*8) + 2))
 #define GPIOA_BIT_C3 (1U<<((2*8) + 3))
 #define GPIOB_BIT_E1 (1U<<((0*8) + 1))
 #define GPIOB_BIT_E2 (1U<<((0*8) + 2))
 
+// helper macros for LEDs
 #define LED_BLUE 	GPIOA_BIT_C2
 #define LED_YELLOW 	GPIOA_BIT_C3
 #define LED_RED 	GPIOA_BIT_B5
+#define LED_ON(b) 	GPIOA->PSOR = (b)
+#define LED_OFF(b) 	GPIOA->PCOR = (b)
 
-#define LED_ON(b) GPIOA->PSOR = (b)
-#define LED_OFF(b) GPIOA->PCOR = (b)
+// define pointer to UART structure
+#define UART0 ((UART_Type *)UART0_BASE)
 
-#define SWITCH GPIOB_BIT_E1
-#define POWER_LATCH GPIOB_BIT_E2
+//
+// TYPE DEFINITIONS
+//
 
 typedef unsigned char byte;
-#define UART0 ((UART_Type *)UART0_BASE)
+
+// Flash codes for errors
+enum {
+	ERR_FORMAT	= 1,	// sysex block framing error (no start / end marker)
+	ERR_ID		= 2,	// sysex is not a valid firmware update
+	ERR_SEQ		= 3,	// sequence number mismatch (comm error)
+	ERR_CSUM	= 4,	// checksum mismatch (comm error)
+	ERR_SERIAL	= 5,	// serial interface error
+	ERR_FLASH	= 6,	// flash programming error
+	ERR_OVERLOW	= 7		// data too large for available memory space
+};
+
+void bootloader(void);
+void ResetISR(void);
+void IntDefaultHandler(void);
+void delay(int count);
+extern void _vStackTop(void);
 
 //*****************************************************************************
 // Flash Configuration block : 16-byte flash configuration field that stores
@@ -66,20 +98,6 @@ __attribute__ ((used,section(".FlashConfig"))) const struct {
     unsigned int word3;
     unsigned int word4;
 } Flash_Config = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFEFFFF};
-
-void ResetISR(void);
-
-__attribute__ ((section(".after_vectors.zzz")))
-void IntDefaultHandler(void) {
-	for(;;);
-}
-
-//*****************************************************************************
-// External declaration for the pointer to the stack top from the Linker Script
-//*****************************************************************************
-extern void _vStackTop(void);
-
-extern int main(void);
 
 
 //*****************************************************************************
@@ -141,15 +159,9 @@ void (* const g_pfnVectors[])(void) = {
 	IntDefaultHandler,         // 44: Watchdog timeout
 };
 
-//__attribute__ ((section(".after_vectors.zzz")))
-void delay(int ms) {
-	while(ms--) {
-		for(volatile int q = 0; q<2000; ++q) {
-			//asm("nop");
-		}
-	}
-}
-
+///////////////////////////////////////////////////////////////////////////
+// This is the entry point
+///////////////////////////////////////////////////////////////////////////
 __attribute__ ((section(".after_vectors.reset")))
 void ResetISR(void) {
 
@@ -162,7 +174,7 @@ void ResetISR(void) {
     WDOG->CS2 |= 0;
     __asm volatile ("cpsie i");
 
-    // configure the input line for the switch
+    // configure the digital input for the "off" switch
 	GPIOB->PDDR &= ~(GPIOB_BIT_E1);
 	GPIOB->PIDR &= ~(GPIOB_BIT_E1);
 	PORT->PUEH |= (GPIOB_BIT_E1);
@@ -172,37 +184,48 @@ void ResetISR(void) {
 	GPIOB->PDDR |= GPIOB_BIT_E2;
 	GPIOB->PSOR = GPIOB_BIT_E2;
 
-	// is the switch being pressed?
+	// is the "off" switch being pressed?
     if(!(GPIOB->PDIR & GPIOB_BIT_E1)) {
-    	main();
+
+    	// run the bootloader (should not return)
+    	bootloader();
     }
     else {
 
-    	unsigned int *app_vtor = (unsigned int*)0xA000;
-
+    	// change the vector table location to point at the
+    	// application base address
+    	unsigned int *app_vtor = (unsigned int*)APP_BASE_ADDR;
     	unsigned int * pSCB_VTOR = (unsigned int *) 0xE000ED08;
     	*pSCB_VTOR = (unsigned int)app_vtor;
 
+    	// get the address of the reset vector for the application
+    	// from address 1 of the vector table
     	typedef void (*app_ptr_t)(void);
     	app_ptr_t the_app = (app_ptr_t)app_vtor[1];
+
+    	// invoke the application via its reset vector
     	the_app();
-
-    	//unsigned int * pSCB_AIRCR = (unsigned int *) 0xE000ED0C;
-    	//*pSCB_AIRCR = (unsigned int)0x05FA0004;
     }
-    for(;;);
 
-    // Check to see if we are running the code from a non-zero
-    // address (eg RAM, external flash), in which case we need
-    // to modify the VTOR register to tell the CPU that the
-    // vector table is located at a non-0x0 address.
-//    unsigned int * pSCB_VTOR = (unsigned int *) 0xE000ED08;
-//    if ((unsigned int *)g_pfnVectors!=(unsigned int *) 0x00000000) {
-//        *pSCB_VTOR = (unsigned int)g_pfnVectors;
-//    }
+    // should not return, but hey
+    for(;;);
 }
 
+__attribute__ ((section(".after_vectors.zzz")))
+void IntDefaultHandler(void) {
+	for(;;);
+}
 
+//__attribute__ ((section(".after_vectors.zzz")))
+void delay(int count) {
+	while(count--) {
+		for(volatile int q = 0; q<2000; ++q) {
+			//asm("nop");
+		}
+	}
+}
+
+/*
 __attribute__ ((section(".after_vectors.zzz")))
 void uart_init() {
     SIM->SCGC |= SIM_SCGC_UART0_MASK;
@@ -210,9 +233,9 @@ void uart_init() {
 	UART0->BDL = 40;
     UART0->C2 |= (UART_C2_TE_MASK|UART_C2_RE_MASK); // enable rx/tx
 }
+*/
 
-
-__attribute__ ((section(".after_vectors.zzz")))
+//__attribute__ ((section(".after_vectors.zzz")))
 void error(int code) {
 	LED_OFF(LED_BLUE);
 	LED_OFF(LED_YELLOW);
@@ -227,6 +250,7 @@ void error(int code) {
 	}
 }
 
+/*
 __attribute__ ((section(".after_vectors.zzz")))
 byte read_byte(byte *ch) {
 	while(!(UART0->S1 & UART_S1_RDRF_MASK)) {
@@ -237,25 +261,26 @@ byte read_byte(byte *ch) {
 	*ch = UART0->D;
 	return 1;
 }
+*/
 
 //Before launching a command, FSTAT[ACCERR] and FSTAT[FPVIOL] must be cleared
 //and the FSTAT[CCIF] flag will be tested to determine the status of the current command
 //write sequence. If FSTAT[CCIF] is 0, indicating that the previous command write
 //sequence is still active, a new command write sequence cannot be started and all writes to
 
-//__attribute__ ((section(".after_vectors.zzz")))
+__attribute__ ((section(".after_vectors.zzz")))
 void fc_init() {
 	while(!(FTMRH->FSTAT & 0x80));
 }
 // set up a parameter for a flash command
-//__attribute__ ((section(".after_vectors.zzz")))
+__attribute__ ((section(".after_vectors.zzz")))
 void fc_param(uint8_t index, uint8_t hi, uint8_t lo) {
     FTMRH->FCCOBIX = index;
     FTMRH->FCCOBHI = hi;
     FTMRH->FCCOBLO = lo;
 }
 // run a flash command
-//__attribute__ ((section(".after_vectors.zzz")))
+__attribute__ ((section(".after_vectors.zzz")))
 void fc_run() {
     __asm volatile ("cpsid i");
 	while(!(FTMRH->FSTAT & 0x80));
@@ -277,7 +302,7 @@ void fc_run() {
 
 
 __attribute__ ((section(".after_vectors.zzz")))
-int main(void) {
+void bootloader(void) {
 	/*
 	// ICS->C1 = 0x22 = 0b00100010
 		7\ CLKS = 00 output of FLL is selected
@@ -329,12 +354,12 @@ int main(void) {
 	GPIOA->PDDR |= (GPIOA_BIT_B5|GPIOA_BIT_C2|GPIOA_BIT_C3);
 
 	// Initialise the UART for 31250bps receive
-    //SIM->SCGC |= SIM_SCGC_UART0_MASK;
-	//UART0->BDH = 0;
-	//UART0->BDL = 40;
-    //UART0->C2 |= UART_C2_RE_MASK;
+    SIM->SCGC |= SIM_SCGC_UART0_MASK;
+	UART0->BDH = 0;
+	UART0->BDL = 40;
+    UART0->C2 |= UART_C2_RE_MASK;
 
-    uart_init();
+//    uart_init();
 
 	// set LEDs to initial state
     LED_ON(LED_BLUE);
@@ -342,8 +367,8 @@ int main(void) {
     LED_OFF(LED_RED) ;
 
 	int i;
-    volatile int seq_no = 0;
-    int addr = WRITE_BASE_ADDR;
+    int seq_no = 0;
+    int addr = APP_BASE_ADDR;
     for(;;) {
 
 
@@ -354,12 +379,7 @@ int main(void) {
 
         byte sysex[SYSEX_BUF_SIZE];
       	for(i = 0; i<SYSEX_BUF_SIZE; ++i) {
-      		//byte ch;
-      		//if(!read_byte(&ch)) {
-      		//	error(ERR_SERIAL);
-      		//}
-      		//sysex[i] = ch;
-      		// wait for a character to be received, or UART error
+      		// wait for a character to be received
       		while(!(UART0->S1 & UART_S1_RDRF_MASK)) {
       			 //check whether an error occurred
       			if(UART0->S1 & (UART_S1_OR_MASK|UART_S1_NF_MASK|UART_S1_FE_MASK|UART_S1_PF_MASK)) {
@@ -390,7 +410,7 @@ int main(void) {
     	}
 
     	// Calculate and validate the checksum
-    	volatile byte csum = 0;
+    	byte csum = 0;
     	for(i=SYSEX_SEQ_OFS; i<SYSEX_CSUM_OFS; ++i) {
     		csum ^= sysex[i];
     	}
@@ -401,8 +421,6 @@ int main(void) {
     	// check for sequence number of zero, which means
     	// end of data
     	if(!sysex[SYSEX_SEQ_OFS]) {
-
-    		// Success indication - need to cycle power to reset
     		for(;;) {
     			LED_ON(LED_BLUE);
     		    LED_OFF(LED_YELLOW);
@@ -458,7 +476,7 @@ int main(void) {
         	}
 
         	// now program 8 bytes into flash, performing the
-        	// neccessary byte re-ordering (~0.2ms)
+        	// necessary byte re-ordering (~0.2ms)
 			fc_init();
 			fc_param(0, 0x06, 0x00);
 			fc_param(1, addr>>8, (byte)addr);
@@ -469,6 +487,9 @@ int main(void) {
 			fc_run();
 			src+=8;
 			addr+=8;
+			if(addr > 0xFFFF) {
+				error(ERR_OVERLOW);
+			}
     	}
 
     	// toggle the blue LED with each data block
@@ -479,7 +500,4 @@ int main(void) {
     		LED_OFF(LED_BLUE);
     	}
     }
-
-
-    return 0 ;
 }
